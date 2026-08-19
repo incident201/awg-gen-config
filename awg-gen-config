@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+awg-gen-config — interactive AmneziaWG 3.1 server config updater for Docker.
+
+What it does:
+  * reads an existing awg0.conf from a Docker container;
+  * preserves PrivateKey, Address, ListenPort and every [Peer] section;
+  * replaces only AmneziaWG obfuscation/protocol parameters;
+  * creates host-side backups before every write/restore;
+  * can restore any backup;
+  * restarts the container after applying a config;
+  * uses Python stdlib only.
+
+Generation rules are based on the current Any-Tech-ARCHITECT generator and
+AmneziaWG 3.x implementation, with AWG 3.1 RandomTrailers/DisableCookies added.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+APP = "awg-gen-config"
+VERSION = "0.1.5"
+DEFAULT_CONTAINER = "amnezia-awg2"
+DEFAULT_CONFIG = "/opt/amnezia/awg/awg0.conf"
+DEFAULT_BACKUP_DIR = "/var/backups/awg-gen-config"
+RNG = secrets.SystemRandom()
+
+# WireGuard / AWG message sizes used by Architect's collision rules.
+MSG_INIT = 148
+MSG_RESPONSE = 92
+MSG_COOKIE = 64
+MSG_TRANSPORT_OVERHEAD = 32  # 16-byte transport header + 16-byte Poly1305 tag
+HP_NONCE_SIZE = 12
+S4_PROTOCOL_MAX = 32
+DEFAULT_UDP_WINDOW = 500
+
+BEGIN_MARKER = "# --- awg-gen-config AWG 3.1 BEGIN ---"
+END_MARKER = "# --- awg-gen-config AWG 3.1 END ---"
+
+MANAGED_KEYS = {
+    "mtu",
+    "jc", "jmin", "jmax",
+    "s1", "s2", "s3", "s4",
+    "h1", "h2", "h3", "h4",
+    "i1", "i2", "i3", "i4", "i5",
+    "headerprotectionkey",
+    "contentpaddingaddition",
+    "rekeyaftertime", "rekeytimeout", "rejectaftertime",
+    "keepalivetimeout", "maxhandshakeattempts",
+    "randomtrailers", "disablecookies",
+}
+
+PROFILE_CHOICES = [
+    ("quic_initial", "QUIC Initial"),
+    ("quic_0rtt", "QUIC 0-RTT"),
+    ("tls_client_hello", "TLS 1.3 ClientHello"),
+    ("wireguard_noise", "WireGuard Noise"),
+    ("dtls", "DTLS"),
+    ("http3", "HTTP/3"),
+    ("sip", "SIP"),
+    ("tls_to_quic", "TLS -> QUIC"),
+    ("quic_burst", "QUIC Burst"),
+    ("dns_query", "DNS Query"),
+    ("random", "Random"),
+]
+
+
+class AppError(RuntimeError):
+    pass
+
+
+BROWSER_FINGERPRINTS = {
+    "chrome":   {"label": "Chrome", "family": "chromium", "qi": (1250,1250), "q0": (1250,1350), "h3": (1250,1350), "tls": (512,800), "nx": (1200,1250), "dtls": (1100,1200)},
+    "edge":     {"label": "Edge", "family": "chromium", "qi": (1250,1250), "q0": (1250,1350), "h3": (1250,1350), "tls": (512,800), "nx": (1200,1250), "dtls": (1100,1200)},
+    "firefox":  {"label": "Firefox", "family": "gecko", "qi": (1200,1252), "q0": (1200,1300), "h3": (1200,1350), "tls": (512,700), "nx": (1200,1250), "dtls": (1050,1200)},
+    "safari":   {"label": "Safari", "family": "webkit", "qi": (1250,1252), "q0": (1250,1300), "h3": (1250,1350), "tls": (512,750), "nx": (1200,1250), "dtls": (1100,1200)},
+    "ios":      {"label": "Safari (iOS)", "family": "webkit", "qi": (1250,1252), "q0": (1250,1300), "h3": (1250,1350), "tls": (512,750), "nx": (1200,1250), "dtls": (1100,1200)},
+    "yandex_desktop": {"label": "Yandex Browser", "family": "chromium", "qi": (1250,1250), "q0": (1250,1350), "h3": (1350,1350), "tls": (512,800), "nx": (1200,1250), "dtls": (1100,1200)},
+    "yandex_mobile":  {"label": "Yandex Browser (mobile)", "family": "chromium", "qi": (1232,1232), "q0": (1250,1350), "h3": (1350,1350), "tls": (512,800), "nx": (1200,1250), "dtls": (1100,1200)},
+    "360":      {"label": "360 Browser", "family": "chromium", "qi": (1250,1250), "q0": (1250,1350), "h3": (1250,1350), "tls": (512,800), "nx": (1200,1250), "dtls": (1100,1200)},
+    "qq":       {"label": "QQ Browser", "family": "chromium", "qi": (1250,1250), "q0": (1250,1350), "h3": (1250,1350), "tls": (512,800), "nx": (1200,1250), "dtls": (1100,1200)},
+}
+
+AUTO_HOSTS = {
+    "quic_initial": "www.google.com",
+    "quic_0rtt": "www.google.com",
+    "http3": "www.google.com",
+    "tls_client_hello": "www.cloudflare.com",
+    "wireguard_noise": "www.cloudflare.com",
+    "dtls": "meet.google.com",
+    "sip": "sip.linphone.org",
+    "dns_query": "www.cloudflare.com",
+}
+
+@dataclass
+class CpsOptions:
+    mtu: int
+    intensity: str
+    host: str
+    use_tag_c: bool
+    use_tag_t: bool
+    use_tag_r: bool
+    use_tag_rc: bool
+    use_tag_rd: bool
+    use_browser_fp: bool
+    browser_profile: str
+    mimic_all: bool
+
+    @property
+    def iv(self) -> int:
+        return {"low": 1, "medium": 2, "high": 3}[self.intensity]
+
+    def fp_range(self, slot: str):
+        if not self.use_browser_fp:
+            return None
+        fp = BROWSER_FINGERPRINTS.get(self.browser_profile)
+        return fp.get(slot) if fp else None
+
+
+@dataclass
+class Generated:
+    mtu: int
+    path_mtu: int
+    outer_ip_version: int
+    intensity: str
+    router_mode: bool
+    extreme: bool
+    jc: int
+    jmin: int
+    jmax: int
+    s1: int
+    s2: int
+    s3: int
+    s4: int
+    h1: str
+    h2: str
+    h3: str
+    h4: str
+    i1: str
+    i2: str
+    i3: str
+    i4: str
+    i5: str
+    header_protection_key: str
+    content_padding_addition: str
+    rekey_after_time: str
+    rekey_timeout: str
+    reject_after_time: str
+    keepalive_timeout: str
+    max_handshake_attempts: str
+    random_trailers: bool
+    disable_cookies: bool
+    profile: str
+    mimic_all: bool
+    safe_tunnel_mtu: int
+    safe_jmax: int
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"{APP}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd: list[str], *, check: bool = True, capture: bool = True, text: bool = True, input_data=None):
+    try:
+        return subprocess.run(
+            cmd,
+            check=check,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            text=text,
+            input=input_data,
+        )
+    except FileNotFoundError:
+        raise AppError(f"command not found: {cmd[0]}")
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        stdout = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        detail = (stderr.strip() or stdout.strip() or f"exit code {e.returncode}")
+        raise AppError(f"command failed: {shlex.join(cmd)}\n{detail}")
+
+
+def docker_exists() -> bool:
+    return shutil.which("docker") is not None
+
+
+def container_exists(container: str) -> bool:
+    p = run(["docker", "inspect", container], check=False)
+    return p.returncode == 0
+
+
+def container_running(container: str) -> bool:
+    p = run(["docker", "inspect", "-f", "{{.State.Running}}", container], check=False)
+    return p.returncode == 0 and p.stdout.strip().lower() == "true"
+
+
+def read_container_file(container: str, config_path: str) -> bytes:
+    p = run(["docker", "exec", container, "cat", config_path], text=False)
+    return p.stdout
+
+
+def q(s: str) -> str:
+    return shlex.quote(s)
+
+
+def copy_bytes_to_container(container: str, config_path: str, data: bytes) -> None:
+    remote_tmp = f"/tmp/{APP}-{os.getpid()}-{secrets.token_hex(4)}.conf"
+    with tempfile.NamedTemporaryFile(prefix=f"{APP}-", suffix=".conf", delete=False) as f:
+        local_tmp = f.name
+        f.write(data)
+    try:
+        run(["docker", "cp", local_tmp, f"{container}:{remote_tmp}"])
+        script = (
+            "set -eu; cfg=$1; tmp=$2; "
+            "mode=$(stat -c '%a' \"$cfg\" 2>/dev/null || echo 600); "
+            "owner=$(stat -c '%u:%g' \"$cfg\" 2>/dev/null || echo 0:0); "
+            "cp \"$tmp\" \"$cfg\"; chmod \"$mode\" \"$cfg\"; chown \"$owner\" \"$cfg\"; rm -f \"$tmp\""
+        )
+        run(["docker", "exec", container, "sh", "-c", script, "sh", config_path, remote_tmp])
+    finally:
+        try:
+            os.unlink(local_tmp)
+        except FileNotFoundError:
+            pass
+        run(["docker", "exec", container, "rm", "-f", remote_tmp], check=False)
+
+
+def preflight_in_container(container: str, config_path: str, data: bytes) -> tuple[bool, str]:
+    """Parse the candidate with awg-quick if available. Missing awg-quick is not an error."""
+    remote_tmp = f"/tmp/{APP}-check-{os.getpid()}-{secrets.token_hex(4)}.conf"
+    with tempfile.NamedTemporaryFile(prefix=f"{APP}-check-", suffix=".conf", delete=False) as f:
+        local_tmp = f.name
+        f.write(data)
+    try:
+        cp = run(["docker", "cp", local_tmp, f"{container}:{remote_tmp}"], check=False)
+        if cp.returncode != 0:
+            return False, (cp.stderr or cp.stdout or "docker cp failed").strip()
+        script = (
+            "if command -v awg-quick >/dev/null 2>&1; then "
+            "  awg-quick strip \"$1\" >/dev/null; exit $?; "
+            "else exit 42; fi"
+        )
+        p = run(["docker", "exec", container, "sh", "-c", script, "sh", remote_tmp], check=False)
+        if p.returncode == 42:
+            return True, "awg-quick not found; parser preflight skipped"
+        if p.returncode != 0:
+            return False, (p.stderr or p.stdout or "awg-quick rejected config").strip()
+        return True, "awg-quick accepted candidate config"
+    finally:
+        try:
+            os.unlink(local_tmp)
+        except FileNotFoundError:
+            pass
+        run(["docker", "exec", container, "rm", "-f", remote_tmp], check=False)
+
+
+def restart_container(container: str) -> None:
+    run(["docker", "restart", container], capture=False)
+    # Docker can return before process state settles. Poll locally and fail only if it never becomes running.
+    for _ in range(30):
+        if container_running(container):
+            return
+        time.sleep(0.2)
+    raise AppError(f"container {container!r} did not return to running state")
+
+
+def interface_name(config_path: str) -> str:
+    name = os.path.basename(config_path)
+    return name[:-5] if name.endswith(".conf") else name
+
+
+def postcheck_interface(container: str, iface: str) -> tuple[bool, str]:
+    script = (
+        "iface=$1; "
+        "if command -v awg >/dev/null 2>&1; then awg show \"$iface\" >/dev/null 2>&1 && exit 0; fi; "
+        "if command -v ip >/dev/null 2>&1; then ip link show \"$iface\" >/dev/null 2>&1 && exit 0; fi; "
+        "exit 1"
+    )
+    for _ in range(20):
+        p = run(["docker", "exec", container, "sh", "-c", script, "sh", iface], check=False)
+        if p.returncode == 0:
+            return True, f"interface {iface} is up/visible"
+        time.sleep(0.25)
+    return False, f"could not verify interface {iface} after restart"
+
+
+def backup_dir(base: str, container: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", container)
+    return Path(base) / safe
+
+
+def create_backup(base: str, container: str, config_path: str, data: bytes, label: str = "backup") -> Path:
+    d = backup_dir(base, container)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        fallback = Path.home() / ".local" / "share" / APP / "backups" / re.sub(r"[^A-Za-z0-9_.-]+", "_", container)
+        fallback.mkdir(parents=True, exist_ok=True)
+        print(f"[!] No permission for {d}; backups will be stored in {fallback}")
+        d = fallback
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    iface = re.sub(r"[^A-Za-z0-9_.-]+", "_", interface_name(config_path))
+    path = d / f"{iface}.{stamp}.{label}.{digest}.conf"
+    path.write_bytes(data)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+def list_backups(base: str, container: str) -> list[Path]:
+    candidates = [backup_dir(base, container), Path.home() / ".local" / "share" / APP / "backups" / re.sub(r"[^A-Za-z0-9_.-]+", "_", container)]
+    found: dict[str, Path] = {}
+    for d in candidates:
+        if d.is_dir():
+            for p in d.glob("*.conf"):
+                found[str(p.resolve())] = p
+    return sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def ask(prompt: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    return value if value else (default or "")
+
+
+def ask_bool(prompt: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        s = input(f"{prompt} [{hint}]: ").strip().lower()
+        if not s:
+            return default
+        if s in {"y", "yes", "д", "да", "1", "on", "true"}:
+            return True
+        if s in {"n", "no", "н", "нет", "0", "off", "false"}:
+            return False
+        print("  Enter yes/no.")
+
+
+def ask_int(prompt: str, default: int, lo: int, hi: int) -> int:
+    while True:
+        s = ask(prompt, str(default))
+        try:
+            n = int(s)
+        except ValueError:
+            print("  Enter an integer.")
+            continue
+        if lo <= n <= hi:
+            return n
+        print(f"  Allowed range: {lo}..{hi}.")
+
+
+def ask_choice(prompt: str, options: list[tuple[str, str]], default_index: int = 0) -> str:
+    print(prompt)
+    for i, (_, label) in enumerate(options, 1):
+        mark = " (default)" if i - 1 == default_index else ""
+        print(f"  {i}. {label}{mark}")
+    while True:
+        s = ask("Choice", str(default_index + 1))
+        try:
+            idx = int(s) - 1
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(options):
+            return options[idx][0]
+        print("  Invalid choice.")
+
+
+def rnd(a: int, b: int) -> int:
+    if a > b:
+        raise AppError(f"internal invalid random range {a}..{b}")
+    return RNG.randint(a, b)
+
+
+def random_hex(n: int) -> str:
+    return secrets.token_hex(n)
+
+
+def random_key_b64() -> str:
+    return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
+def format_range(lo: int, hi: int) -> str:
+    return str(lo) if lo == hi else f"{lo}-{hi}"
+
+
+def parse_range(s: str) -> tuple[int, int]:
+    m = re.fullmatch(r"\s*(\d+)(?:\s*-\s*(\d+))?\s*", s)
+    if not m:
+        raise ValueError(s)
+    lo = int(m.group(1))
+    hi = int(m.group(2) or lo)
+    if lo > hi:
+        raise ValueError(s)
+    return lo, hi
+
+
+def extract_interface_value(text: str, key: str) -> Optional[str]:
+    in_interface = False
+    target = key.lower()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_interface = stripped.lower() == "[interface]"
+            continue
+        if not in_interface or stripped.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k.strip().lower() == target:
+            return v.strip()
+    return None
+
+
+def remove_managed_from_interface(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    in_interface = False
+    in_our_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == BEGIN_MARKER:
+            in_our_block = True
+            continue
+        if in_our_block:
+            if stripped == END_MARKER:
+                in_our_block = False
+            continue
+
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_interface = stripped.lower() == "[interface]"
+            out.append(line)
+            continue
+
+        if in_interface:
+            # Remove both active and directly commented managed assignments.
+            m = re.match(r"^\s*#?\s*([A-Za-z][A-Za-z0-9]*)\s*=", line)
+            if m and m.group(1).lower() in MANAGED_KEYS:
+                continue
+        out.append(line)
+    return out
+
+
+def merge_config(original: str, block: str) -> str:
+    lines = original.splitlines()
+    cleaned = remove_managed_from_interface(lines)
+
+    interface_idx = None
+    next_section = len(cleaned)
+    for i, line in enumerate(cleaned):
+        if line.strip().lower() == "[interface]":
+            interface_idx = i
+            break
+    if interface_idx is None:
+        raise AppError("config has no [Interface] section")
+    for i in range(interface_idx + 1, len(cleaned)):
+        s = cleaned[i].strip()
+        if s.startswith("[") and s.endswith("]"):
+            next_section = i
+            break
+
+    before = cleaned[:next_section]
+    after = cleaned[next_section:]
+    while before and before[-1].strip() == "":
+        before.pop()
+    while after and after[0].strip() == "":
+        after.pop(0)
+
+    result = before + ["", *block.splitlines()]
+    if after:
+        result += ["", *after]
+    return "\n".join(result).rstrip() + "\n"
+
+
+def header_zones(max_h: int, extreme: bool) -> dict[str, tuple[int, int, int]]:
+    wide = 10_000_000 if extreme else 100_000_000
+    wide_h4 = 15_000_000 if extreme else 150_000_000
+    if max_h >= 4_294_967_295:
+        return {
+            "H1": (100_000_000, 900_000_000, wide),
+            "H2": (1_200_000_000, 2_000_000_000, wide),
+            "H3": (2_400_000_000, 3_200_000_000, wide),
+            "H4": (3_600_000_000, 4_000_000_000, wide_h4),
+        }
+    zone = max_h // 5
+    gap = 10_000
+    def spread(want: int) -> int:
+        return max(1, min(want, zone - gap))
+    return {
+        "H1": (zone, zone * 2 - gap, spread(wide)),
+        "H2": (zone * 2, zone * 3 - gap, spread(wide)),
+        "H3": (zone * 3, zone * 4 - gap, spread(wide)),
+        "H4": (zone * 4, max_h, spread(wide_h4)),
+    }
+
+
+def draw_header_range(zone: tuple[int, int, int], max_h: int) -> str:
+    zmin, zmax, spread = zone
+    width = rnd(1000, 50_000)
+    headroom = spread + 50_000
+    top = max(zmin, zmax - headroom)
+    base = rnd(zmin, top)
+    start = base + rnd(0, spread)
+    start = min(start, max(0, max_h - width), zmax - width)
+    start = max(zmin, start)
+    end = min(start + width, zmax, max_h)
+    if end <= start:
+        start = max(zmin, end - 1000)
+    return f"{start}-{end}"
+
+
+def generate_sizes(router_mode: bool, extreme: bool, header_protection: bool) -> tuple[int, int, int, int]:
+    floor = HP_NONCE_SIZE if header_protection else 1
+    s12_max = 20 if router_mode else 150
+    if floor > s12_max:
+        raise AppError("S1/S2 range is empty")
+
+    # Current Architect extreme mode intentionally draws S3 above the normal 64 ceiling.
+    s3_lo, s3_hi = (65, 256) if extreme else (floor, 64)
+    if not extreme:
+        s3_lo = floor
+    s4_lo, s4_hi = floor, S4_PROTOCOL_MAX
+
+    for _ in range(1000):
+        s1 = rnd(floor, s12_max)
+        s2 = rnd(floor, s12_max)
+        s3 = rnd(s3_lo, s3_hi)
+        s4 = rnd(s4_lo, s4_hi)
+        if s2 == s1 + (MSG_INIT - MSG_RESPONSE):
+            continue
+        if s3 == s1 + (MSG_INIT - MSG_COOKIE):
+            continue
+        if s3 == s2 + (MSG_RESPONSE - MSG_COOKIE):
+            continue
+        return s1, s2, s3, s4
+    raise AppError("failed to draw non-colliding S1-S4")
+
+
+def generate_junk(intensity: str, junk_level: int, router_mode: bool, extreme: bool, safe_jmax: int) -> tuple[int, int, int]:
+    normal_min = {
+        "low": (64, 256),
+        "medium": (128, 512),
+        "high": (256, 768),
+    }
+    normal_max = {
+        "low": (256, 512),
+        "medium": (512, 1024),
+        "high": (768, 1280),
+    }
+
+    ceiling = 128 if extreme else 15
+    jc = junk_level
+    if jc > 0:
+        jc = max(1, min(ceiling, jc + rnd(-1, 1)))
+    elif extreme:
+        # Mirrors Architect's extreme-mode behavior when level=0.
+        jc = rnd(1, min(8, ceiling))
+    if router_mode:
+        jc = 0 if junk_level == 0 else min(jc, 3)
+
+    if router_mode:
+        min_range = (16, 31)
+        max_range = (96, 128)
+    else:
+        min_range = normal_min[intensity]
+        max_range = normal_max[intensity]
+
+    max_hi = min(max_range[1], safe_jmax)
+    max_lo = min(max_range[0], max_hi)
+    # Jmax must leave at least 64 bytes below it for Jmin variation.
+    jmin_hi = min(min_range[1], max_hi - 65)
+    jmin_lo = min_range[0]
+    if jmin_hi < jmin_lo:
+        # Path MTU is too small for the selected intensity. Adapt rather than emit an invalid pair.
+        jmin_lo = max(1, min(64, max_hi - 65))
+        jmin_hi = max(jmin_lo, max_hi - 65)
+    if max_hi < 66:
+        raise AppError(f"path MTU is too small for a useful junk train (safe Jmax={safe_jmax})")
+
+    jmin = rnd(jmin_lo, jmin_hi)
+    lower_jmax = max(max_lo, jmin + 65)
+    if lower_jmax > max_hi:
+        lower_jmax = jmin + 65
+    jmax = rnd(lower_jmax, max_hi)
+    return jc, jmin, jmax
+
+
+def gen_timings(intensity: str) -> tuple[str, str, str, str, str]:
+    spread = {"low": 10, "medium": 25, "high": 45}[intensity]
+    rekey_timeout_lo = rnd(4, 6)
+    rekey_timeout_hi = rekey_timeout_lo + rnd(1, 4)
+    keepalive_lo = rnd(8, 14)
+    keepalive_hi = keepalive_lo + rnd(2, 8)
+    rekey_after_lo = rnd(100, 120)
+    rekey_after_hi = rekey_after_lo + rnd(10, spread)
+    reject_floor = rekey_after_hi + keepalive_hi + rekey_timeout_hi + 15
+    reject_lo = max(170, reject_floor)
+    reject_hi = reject_lo + rnd(10, spread)
+    attempts_lo = rnd(12, 18)
+    attempts_hi = attempts_lo + rnd(2, 10)
+    return (
+        format_range(rekey_after_lo, rekey_after_hi),
+        format_range(rekey_timeout_lo, rekey_timeout_hi),
+        format_range(reject_lo, reject_hi),
+        format_range(keepalive_lo, keepalive_hi),
+        format_range(attempts_lo, attempts_hi),
+    )
+
+
+def gen_content_padding(intensity: str, router_mode: bool) -> str:
+    if router_mode:
+        return "4-32"
+    spans = {"low": (8, 64), "medium": (16, 128), "high": (24, 200)}
+    lo, hi = spans[intensity]
+    min_v = rnd(lo, (lo + hi) // 2)
+    max_v = rnd(min_v + 8, hi)
+    return format_range(min_v, max_v)
+
+
+def split_pad(n: int, tag: str = "r") -> str:
+    n = max(0, int(n))
+    out = []
+    while n > 1000:
+        out.append(f"<{tag} 1000>")
+        n -= 1000
+    if n:
+        out.append(f"<{tag} {n}>")
+    return "".join(out)
+
+
+def hex_pad(value: int, byte_len: int) -> str:
+    return f"{max(0, int(value)):0{byte_len * 2}x}"[-byte_len * 2:]
+
+
+def quic_varint(value: int) -> str:
+    n = max(0, int(value))
+    if n < 0x40:
+        return hex_pad(n, 1)
+    if n < 0x4000:
+        return hex_pad(0x4000 + n, 2)
+    if n < 0x40000000:
+        return hex_pad(0x80000000 + n, 4)
+    high = n // 0x100000000
+    low = n % 0x100000000
+    return hex_pad(0xC0000000 + high, 4) + hex_pad(low, 4)
+
+
+def calc_padding(header_b: int, extra_b: int, fp_range, iv: int, mtu: int) -> int:
+    max_pad = max(0, mtu - header_b - extra_b)
+    if fp_range is None:
+        return min(rnd(20, 80) * iv, 500, max_pad)
+    min_v, max_v = fp_range
+    clamped_min = min(min_v, mtu)
+    clamped_max = min(max_v, mtu)
+    occupied = header_b + extra_b
+    needed = max(0, clamped_min - occupied)
+    jitter = max(0, min(clamped_max - clamped_min, clamped_max - occupied - needed, 20))
+    pad = needed + (rnd(0, jitter) if jitter else 0)
+    return min(pad, max_pad)
+
+
+def ascii_hex(text: str) -> str:
+    return text.encode("utf-8").hex()
+
+
+def encode_dns_name(host: str) -> str:
+    out = bytearray()
+    for label in host.split("."):
+        if not label:
+            continue
+        raw = label.encode("ascii", errors="ignore")[:63]
+        if len(out) + 1 + len(raw) + 1 > 255:
+            break
+        out.append(len(raw))
+        out.extend(raw)
+    out.append(0)
+    return out.hex()
+
+
+def profile_host(profile: str, requested: str) -> str:
+    if requested.strip():
+        return requested.strip()
+    role = profile
+    if role in {"tls_to_quic", "quic_burst", "random"}:
+        role = "quic_initial"
+    return AUTO_HOSTS.get(role, "www.cloudflare.com")
+
+
+def mk_quic_initial(o: CpsOptions) -> str:
+    host = o.host
+    dcid = rnd(8, 20)
+    scid = rnd(0, 20)
+    token_len = 0 if rnd(0, 1) == 0 else rnd(8, 32)
+    sni_rc = min(len(host) + rnd(0, 6), 64)
+    pn_len = rnd(1, 4)
+    prefix = hex_pad(0xC0 | (pn_len - 1), 1) + "00000001" + hex_pad(dcid, 1) + random_hex(dcid) + hex_pad(scid, 1) + random_hex(scid) + quic_varint(token_len) + random_hex(token_len)
+    extra_b = (sni_rc if o.use_tag_rc else 0) + (4 if o.use_tag_c else 0) + (4 if o.use_tag_t else 0)
+    header_b = len(prefix) // 2 + 2 + pn_len
+    pad = calc_padding(header_b, extra_b, o.fp_range("qi"), o.iv, o.mtu)
+    sent_pad = pad if o.use_tag_r else 0
+    blob = prefix + quic_varint(pn_len + sent_pad + extra_b) + random_hex(pn_len)
+    return f"<b 0x{blob}>" + (f"<rc {sni_rc}>" if o.use_tag_rc else "") + ("<c>" if o.use_tag_c else "") + ("<t>" if o.use_tag_t else "") + (split_pad(pad) if o.use_tag_r else "")
+
+
+def mk_quic_0rtt(o: CpsOptions) -> str:
+    host = o.host
+    dcid = rnd(8, 20)
+    scid = rnd(0, 20)
+    ticket_hint = min(len(host) + rnd(4, 16), 48)
+    pn_len = rnd(1, 4)
+    prefix = hex_pad(0xD0 | (pn_len - 1), 1) + "00000001" + hex_pad(dcid, 1) + random_hex(dcid) + hex_pad(scid, 1) + random_hex(scid)
+    header_b = len(prefix) // 2 + 2 + pn_len
+    extra_b = (ticket_hint if o.use_tag_rc else 0) + (4 if o.use_tag_c else 0) + (4 if o.use_tag_t else 0)
+    pad = calc_padding(header_b, extra_b, o.fp_range("q0"), o.iv, o.mtu)
+    sent_pad = pad if o.use_tag_r else 0
+    blob = prefix + quic_varint(pn_len + sent_pad + extra_b) + random_hex(pn_len)
+    return f"<b 0x{blob}>" + ("<t>" if o.use_tag_t else "") + (split_pad(pad) if o.use_tag_r else "") + (f"<rc {ticket_hint}>" if o.use_tag_rc else "") + ("<c>" if o.use_tag_c else "")
+
+
+def mk_http3(o: CpsOptions) -> str:
+    host = o.host
+    dcid = rnd(8, 20)
+    scid = rnd(0, 20)
+    sni_len = min(len(host) + 9 + rnd(0, 6), 64)
+    pn_len = rnd(1, 4)
+    is_initial = rnd(0, 1) == 0
+    token_len = rnd(8, 32) if is_initial and rnd(0, 1) == 1 else 0
+    prefix = hex_pad((0xC0 if is_initial else 0xE0) | (pn_len - 1), 1) + "00000001" + hex_pad(dcid, 1) + random_hex(dcid) + hex_pad(scid, 1) + random_hex(scid)
+    if is_initial:
+        prefix += quic_varint(token_len) + random_hex(token_len)
+    header_b = len(prefix) // 2 + 2 + pn_len
+    extra_b = (sni_len if o.use_tag_rc else 0) + (4 if o.use_tag_c else 0) + (4 if o.use_tag_t else 0)
+    pad = calc_padding(header_b, extra_b, o.fp_range("h3"), o.iv, o.mtu)
+    sent_pad = pad if o.use_tag_r else 0
+    blob = prefix + quic_varint(pn_len + sent_pad + extra_b) + random_hex(pn_len)
+    return f"<b 0x{blob}>" + (f"<rc {sni_len}>" if o.use_tag_rc else "") + (split_pad(pad) if o.use_tag_r else "") + ("<c>" if o.use_tag_c else "") + ("<t>" if o.use_tag_t else "")
+
+
+def mk_tls(o: CpsOptions) -> str:
+    host = o.host
+    sni_ext = 2 + 2 + 2 + 1 + 2 + len(host)
+    sni_rc = min(sni_ext, 64)
+    fp = o.fp_range("tls")
+    base_len = rnd(*fp) if fp else rnd(300, 550)
+    family = BROWSER_FINGERPRINTS.get(o.browser_profile, {}).get("family")
+    target = ((base_len + 127) // 128) * 128 if family == "chromium" else base_len
+    tag_b = (sni_rc if o.use_tag_rc else 0) + (4 if o.use_tag_c else 0) + (4 if o.use_tag_t else 0)
+    fixed = 5 + 38 + tag_b
+    padding = max(0, min(target - fixed, o.mtu - fixed, rnd(20, 60) * o.iv, 300)) if o.use_tag_r else 0
+    record_len = 38 + tag_b + padding
+    handshake_len = record_len - 4
+    blob = "160301" + hex_pad(record_len, 2) + "01" + hex_pad(handshake_len, 3) + "0303" + random_hex(32)
+    return f"<b 0x{blob}>" + (f"<rc {sni_rc}>" if o.use_tag_rc else "") + (split_pad(padding) if o.use_tag_r else "") + ("<c>" if o.use_tag_c else "") + ("<t>" if o.use_tag_t else "")
+
+
+def mk_noise(o: CpsOptions) -> str:
+    rc_len = rnd(4, 12)
+    header_b = 148
+    extra_b = (rc_len if o.use_tag_rc else 0) + (4 if o.use_tag_c else 0) + (4 if o.use_tag_t else 0)
+    fp = o.fp_range("nx")
+    pad = calc_padding(header_b, extra_b, fp, o.iv, o.mtu) if fp else min(rnd(10, 40) * o.iv, 200, max(0, o.mtu - header_b - extra_b))
+    chain = f"<b 0x01000000{random_hex(4)}><b 0x{random_hex(32)}><b 0x{random_hex(48)}><b 0x{random_hex(28)}><b 0x{random_hex(32)}>"
+    chain += split_pad(pad) if o.use_tag_r else ""
+    chain += "<t>" if o.use_tag_t else ""
+    chain += f"<rc {rc_len}>" if o.use_tag_rc else ""
+    chain += "<c>" if o.use_tag_c else ""
+    return chain
+
+
+def mk_dtls(o: CpsOptions) -> str:
+    host = o.host
+    sni_rc = min(len(host) + rnd(2, 8), 60)
+    tag_b = (sni_rc if o.use_tag_rc else 0) + (4 if o.use_tag_c else 0) + (4 if o.use_tag_t else 0)
+    fixed = 13 + 12 + 34
+    padding = calc_padding(fixed, tag_b, o.fp_range("dtls"), o.iv, o.mtu) if o.use_tag_r else 0
+    body_len = 34 + tag_b + padding
+    record_len = 12 + body_len
+    blob = "16fefd0000" + hex_pad(0, 4) + hex_pad(rnd(0, 4), 2) + hex_pad(record_len, 2) + "01" + hex_pad(body_len, 3) + "0000" + "000000" + hex_pad(body_len, 3) + "fefd" + random_hex(32)
+    return f"<b 0x{blob}>" + (f"<rc {sni_rc}>" if o.use_tag_rc else "") + ("<c>" if o.use_tag_c else "") + ("<t>" if o.use_tag_t else "") + (split_pad(padding) if o.use_tag_r else "")
+
+
+def mk_sip(o: CpsOptions) -> str:
+    host = o.host
+    user = f"user{rnd(1000,9999)}"
+    token = lambda n: random_hex(n)
+    rc_val = min(len(host) + rnd(8, 24) * o.iv, 150)
+    tag_b = (rc_val if o.use_tag_rc else 0) + (4 if o.use_tag_c else 0) + (4 if o.use_tag_t else 0)
+    headers = [
+        f"REGISTER sip:{host} SIP/2.0",
+        f"Via: SIP/2.0/UDP {host}:5060;branch=z9hG4bK{token(7)};rport",
+        "Max-Forwards: 70",
+        f"From: <sip:{user}@{host}>;tag={token(5)}",
+        f"To: <sip:{user}@{host}>",
+        f"Call-ID: {token(10)}@{host}",
+        f"CSeq: {rnd(1,9999)} REGISTER",
+        f"Contact: <sip:{user}@{host}:5060>;expires=3600",
+        f"User-Agent: {'Linphone/5.2.5' if o.mimic_all else 'PJSUA v2.13'}",
+    ]
+    prefix = "\r\n".join(headers) + "\r\n"
+    room = max(0, o.mtu - len(prefix.encode()) - tag_b - len("Content-Length: 9999\r\n\r\n"))
+    padding = min(rnd(5, 30) * o.iv, 120, room) if o.use_tag_r else 0
+    message = f"{prefix}Content-Length: {padding + tag_b}\r\n\r\n"
+    return f"<b 0x{ascii_hex(message)}>" + (f"<rc {rc_val}>" if o.use_tag_rc else "") + ("<c>" if o.use_tag_c else "") + ("<t>" if o.use_tag_t else "") + (split_pad(padding) if o.use_tag_r else "")
+
+
+def mk_dns(o: CpsOptions) -> str:
+    host = o.host
+    wants_ipv6 = o.iv % 2 != 0
+    txid = random_hex(2)
+    question = encode_dns_name(host) + ("001c" if wants_ipv6 else "0001") + "0001"
+    question_b = len(question) // 2
+    ceiling = min(512, o.mtu - 20)
+    wanted = max(0, ceiling) if ceiling <= 64 else rnd(64, ceiling)
+    room = o.mtu - 12 - question_b - 11 - 4
+    padding = max(0, min(wanted - 12 - question_b, room, 200)) if o.use_tag_r else 0
+    padded = padding > 0
+    arcount = "0001" if padded else "0000"
+    opt = ""
+    if padded:
+        opt = "00" + "0029" + hex_pad(1232, 2) + "00000000" + hex_pad(4 + padding, 2) + "000c" + hex_pad(padding, 2)
+    blob = txid + "0100" + "0001" + "0000" + "0000" + arcount + question + opt
+    return f"<b 0x{blob}>" + (split_pad(padding) if padded else "") + ("<t>" if o.use_tag_t else "") + ("<c>" if o.use_tag_c else "")
+
+
+def profile_chain(profile: str, o: CpsOptions) -> str:
+    dispatch = {
+        "quic_initial": mk_quic_initial, "quic_0rtt": mk_quic_0rtt, "tls_client_hello": mk_tls,
+        "wireguard_noise": mk_noise, "dtls": mk_dtls, "http3": mk_http3, "sip": mk_sip, "dns_query": mk_dns,
+    }
+    try:
+        return dispatch[profile](o)
+    except KeyError:
+        raise AppError(f"unsupported profile: {profile}")
+
+
+def entropy_chain(o: CpsOptions, idx: int) -> str:
+    is_big = rnd(1, 10) > 6
+    base_len = rnd(200, 500) if is_big else rnd(4, 20)
+    r_len = min(base_len * o.iv, 500 if is_big else 60, max(0, o.mtu - 20 - (4 if o.use_tag_c else 0) - (4 if o.use_tag_t else 0)))
+    rc_len = rnd(4, 12)
+    rd_len = rnd(4, 8)
+    c = "<c>" if o.use_tag_c else ""
+    t = "<t>" if o.use_tag_t else ""
+    r = split_pad(r_len) if o.use_tag_r else ""
+    rc = f"<rc {rc_len}>" if o.use_tag_rc else ""
+    rd = f"<rd {rd_len}>" if o.use_tag_rd else ""
+    b = f"<b 0x{random_hex(rnd(4, 8 * o.iv))}>" if o.iv >= 2 else ""
+    b2 = f"<b 0x{random_hex(rnd(2, 4))}>" if o.iv >= 3 else ""
+    patterns = [b+r+t+rc+c+rd, c+t+b+r+rc+rd, rc+b+r+c+t+rd, t+r+c+rc+b+rd, r+rc+b+t+c+rd, b2+t+r+b+rc+c+rd, rd+b+rc+r+t+c+b2, c+b+b2+t+rc+r+rd]
+    result = patterns[(idx + rnd(0, len(patterns)-1)) % len(patterns)]
+    return result or "<r 10>"
+
+
+def generate_cps(profile: str, options: CpsOptions, router_mode: bool) -> tuple[str, str, str, str, str, str]:
+    simple = ["quic_initial", "quic_0rtt", "tls_client_hello", "wireguard_noise", "dtls", "http3", "sip", "dns_query"]
+    actual = RNG.choice(simple) if profile == "random" else profile
+    # Keep host role sensible for random/composite packets when auto-host was selected.
+    if actual in simple and not options.host:
+        options.host = profile_host(actual, "")
+
+    if actual == "tls_to_quic":
+        tls_opts = CpsOptions(**{**options.__dict__, "host": profile_host("tls_client_hello", options.host)})
+        quic_opts = CpsOptions(**{**options.__dict__, "host": profile_host("quic_initial", options.host)})
+        chains = [mk_tls(tls_opts), mk_quic_initial(quic_opts), entropy_chain(options, 2), entropy_chain(options, 3), entropy_chain(options, 4)]
+    elif actual == "quic_burst":
+        qopts = CpsOptions(**{**options.__dict__, "host": profile_host("quic_initial", options.host)})
+        chains = [mk_quic_initial(qopts), mk_quic_0rtt(qopts), mk_http3(qopts), entropy_chain(options, 3), entropy_chain(options, 4)]
+    else:
+        i1 = profile_chain(actual, options)
+        chains = [i1] + ([profile_chain(actual, options) for _ in range(4)] if options.mimic_all else [entropy_chain(options, i) for i in range(1, 5)])
+
+    if router_mode:
+        chains = [chains[0], "", "", "", ""]
+    return (*chains, actual)
+
+def validate_generated(g: Generated, header_protection: bool, content_padding_enabled: bool) -> list[str]:
+    errors: list[str] = []
+    ranges = []
+    for name, raw in [("H1", g.h1), ("H2", g.h2), ("H3", g.h3), ("H4", g.h4)]:
+        lo, hi = parse_range(raw)
+        ranges.append((name, lo, hi))
+    for i in range(len(ranges)):
+        for j in range(i + 1, len(ranges)):
+            a, alo, ahi = ranges[i]
+            b, blo, bhi = ranges[j]
+            if alo <= bhi and blo <= ahi:
+                errors.append(f"{a}/{b} header ranges overlap")
+
+    if g.s2 == g.s1 + 56:
+        errors.append("S1/S2 message-size collision")
+    if g.s3 == g.s1 + 84:
+        errors.append("S1/S3 message-size collision")
+    if g.s3 == g.s2 + 28:
+        errors.append("S2/S3 message-size collision")
+    if not (1 <= g.s4 <= S4_PROTOCOL_MAX):
+        errors.append("S4 out of protocol range")
+    if header_protection and min(g.s1, g.s2, g.s3, g.s4) < HP_NONCE_SIZE:
+        errors.append("S1-S4 must be >=12 with HeaderProtectionKey")
+    if g.jc < 0 or g.jmin < 0 or g.jmax <= g.jmin + 64:
+        errors.append("invalid junk range")
+    if g.jmax > g.safe_jmax:
+        errors.append("Jmax exceeds safe outer UDP payload for selected path MTU")
+    if len(base64.b64decode(g.header_protection_key or "", validate=True)) != 32 if g.header_protection_key else False:
+        errors.append("HeaderProtectionKey is not 32 bytes")
+    if content_padding_enabled and not g.content_padding_addition:
+        errors.append("ContentPaddingAddition requested but empty")
+    return errors
+
+
+def render_generated_block(g: Generated) -> str:
+    lines = [
+        BEGIN_MARKER,
+        f"# profile={g.profile}; intensity={g.intensity}; path-mtu={g.path_mtu}; outer-ipv{g.outer_ip_version}",
+        f"MTU = {g.mtu}",
+        "",
+        f"Jc = {g.jc}",
+        f"Jmin = {g.jmin}",
+        f"Jmax = {g.jmax}",
+        "",
+        f"S1 = {g.s1}",
+        f"S2 = {g.s2}",
+        f"S3 = {g.s3}",
+        f"S4 = {g.s4}",
+        "",
+        f"H1 = {g.h1}",
+        f"H2 = {g.h2}",
+        f"H3 = {g.h3}",
+        f"H4 = {g.h4}",
+    ]
+    cps = [("I1", g.i1), ("I2", g.i2), ("I3", g.i3), ("I4", g.i4), ("I5", g.i5)]
+    active_cps = [(k, v) for k, v in cps if v]
+    if active_cps:
+        lines.append("")
+        # Official Amnezia server configs keep I1-I5 commented out. They are
+        # stored in awg0.conf for client-config generation, not applied to the
+        # server interface by awg-quick.
+        lines.extend(f"# {k} = {v}" for k, v in active_cps)
+
+    if g.header_protection_key:
+        lines += ["", f"HeaderProtectionKey = {g.header_protection_key}"]
+    if g.content_padding_addition:
+        lines.append(f"ContentPaddingAddition = {g.content_padding_addition}")
+    if g.rekey_after_time:
+        lines += [
+            f"RekeyAfterTime = {g.rekey_after_time}",
+            f"RekeyTimeout = {g.rekey_timeout}",
+            f"RejectAfterTime = {g.reject_after_time}",
+            f"KeepaliveTimeout = {g.keepalive_timeout}",
+            f"MaxHandshakeAttempts = {g.max_handshake_attempts}",
+        ]
+    lines += [
+        f"RandomTrailers = {'on' if g.random_trailers else 'off'}",
+        f"DisableCookies = {'on' if g.disable_cookies else 'off'}",
+        END_MARKER,
+    ]
+    return "\n".join(lines)
+
+
+def generate_interactive(current_text: str) -> Generated:
+    print("\nAWG 3.1 generation\n")
+
+    path_mtu = ask_int("Outer/path MTU", 1500, 576, 9000)
+    outer_ip = int(ask_choice("Outer IP header to budget for:", [("6", "IPv6 / conservative (40-byte IP header)"), ("4", "IPv4 only (20-byte IP header)")], 0))
+
+    router_mode = ask_bool("Router/low-power mode", False)
+    extreme = ask_bool("Extreme parameter ceilings", False)
+    intensity = ask_choice("Junk / entropy intensity:", [("low", "Low"), ("medium", "Medium"), ("high", "High")], 1)
+
+    jc_hi = 128 if extreme else 15
+    if router_mode:
+        jc_default = 3
+        jc_hi = min(jc_hi, 3)
+    else:
+        jc_default = 5
+    junk_level = ask_int("Requested junk packet count (generator may vary it by ±1)", jc_default, 0, jc_hi)
+
+    header_protection = ask_bool("HeaderProtectionKey", True)
+    random_trailers = ask_bool("RandomTrailers (AWG 3.1)", True)
+    if random_trailers:
+        print("  Note: ContentPaddingAddition has priority on transport packets; leave it off to use RandomTrailers there.")
+        content_padding = ask_bool("Also enable ContentPaddingAddition", False)
+    else:
+        content_padding = ask_bool("Enable ContentPaddingAddition", True)
+    random_timings = ask_bool("Randomised protocol timers", True)
+    disable_cookies = ask_bool("DisableCookies (AWG 3.1)", False)
+
+    max_h = 4_294_967_295
+    legacy_h = ask_bool("Use legacy signed-32-bit H ceiling (2147483647)", False)
+    if legacy_h:
+        max_h = 2_147_483_647
+
+    s1, s2, s3, s4 = generate_sizes(router_mode, extreme, header_protection)
+
+    # Conservative no-fragmentation budget for a full-size transport packet:
+    # inner MTU + S4 + 32 WG/AWG transport bytes + UDP(8) + outer IP(20/40).
+    outer_ip_header = 40 if outer_ip == 6 else 20
+    safe_tunnel_mtu = path_mtu - outer_ip_header - 8 - MSG_TRANSPORT_OVERHEAD - s4
+    safe_jmax = path_mtu - outer_ip_header - 8
+    if safe_tunnel_mtu < 576:
+        raise AppError(
+            f"selected path MTU leaves only {safe_tunnel_mtu} bytes for tunnel MTU with S4={s4}; choose a larger path MTU or different settings"
+        )
+
+    current_mtu_raw = extract_interface_value(current_text, "MTU")
+    current_mtu = None
+    if current_mtu_raw:
+        try:
+            current_mtu = int(current_mtu_raw)
+        except ValueError:
+            pass
+    recommended = current_mtu if current_mtu and current_mtu <= safe_tunnel_mtu else min(1280, safe_tunnel_mtu)
+    print(f"\n  S4={s4}; conservative no-fragmentation tunnel MTU <= {safe_tunnel_mtu} for selected outer path.")
+    mtu = ask_int("AWG interface MTU", recommended, 576, 9000)
+    if mtu > safe_tunnel_mtu:
+        print(f"  WARNING: MTU {mtu} exceeds conservative bound {safe_tunnel_mtu}; outer fragmentation/PMTU handling may be required.")
+        if not ask_bool("Keep this MTU anyway", False):
+            mtu = ask_int("AWG interface MTU", min(1280, safe_tunnel_mtu), 576, safe_tunnel_mtu)
+
+    jc, jmin, jmax = generate_junk(intensity, junk_level, router_mode, extreme, safe_jmax)
+    print(f"  Safe outer UDP junk payload ceiling for this path: {safe_jmax} bytes; generated Jmax={jmax}.")
+
+    zones = header_zones(max_h, extreme)
+    h1 = draw_header_range(zones["H1"], max_h)
+    h2 = draw_header_range(zones["H2"], max_h)
+    h3 = draw_header_range(zones["H3"], max_h)
+    h4 = draw_header_range(zones["H4"], max_h)
+
+    # I1-I5 are always regenerated together with the rest of the obfuscation
+    # parameters. There is deliberately no keep/skip/remove mode: mixing old
+    # CPS chains with a newly generated obfuscation set is not supported.
+    selected = ask_choice("Mimicry profile:", PROFILE_CHOICES, 0)
+    mimic_all = False
+    if selected not in {"tls_to_quic", "quic_burst"} and not router_mode:
+        mimic_all = ask_bool("Mimic all I1-I5 with the selected profile (instead of entropy I2-I5)", False)
+
+    custom_host = ask("Custom mimic host (blank = automatic)", "")
+    host = profile_host(selected, custom_host)
+
+    use_browser_fp = ask_bool("Use browser packet-size fingerprint", False)
+    browser_profile = "chrome"
+    if use_browser_fp:
+        fp_options = [(k, str(v["label"])) for k, v in BROWSER_FINGERPRINTS.items()]
+        browser_profile = ask_choice("Browser fingerprint:", fp_options, 0)
+
+    print("CPS tags (web-generator defaults are C=off, T/R/RC/RD=on):")
+    use_tag_c = ask_bool("  Use <c> counter tag", False)
+    use_tag_t = ask_bool("  Use <t> timestamp tag", True)
+    use_tag_r = ask_bool("  Use <r N> random-byte padding", True)
+    use_tag_rc = ask_bool("  Use <rc N> random-character padding", True)
+    use_tag_rd = ask_bool("  Use <rd N> random-digit padding", True)
+
+    cps_options = CpsOptions(
+        mtu=mtu, intensity=intensity, host=host,
+        use_tag_c=use_tag_c, use_tag_t=use_tag_t, use_tag_r=use_tag_r,
+        use_tag_rc=use_tag_rc, use_tag_rd=use_tag_rd,
+        use_browser_fp=use_browser_fp, browser_profile=browser_profile,
+        mimic_all=mimic_all,
+    )
+    i1, i2, i3, i4, i5, profile = generate_cps(selected, cps_options, router_mode)
+
+    hpk = random_key_b64() if header_protection else ""
+    cpa = gen_content_padding(intensity, router_mode) if content_padding else ""
+    if random_timings:
+        rekey_after, rekey_timeout, reject_after, keepalive_timeout, max_attempts = gen_timings(intensity)
+    else:
+        rekey_after = rekey_timeout = reject_after = keepalive_timeout = max_attempts = ""
+
+    g = Generated(
+        mtu=mtu, path_mtu=path_mtu, outer_ip_version=outer_ip, intensity=intensity,
+        router_mode=router_mode, extreme=extreme,
+        jc=jc, jmin=jmin, jmax=jmax,
+        s1=s1, s2=s2, s3=s3, s4=s4,
+        h1=h1, h2=h2, h3=h3, h4=h4,
+        i1=i1, i2=i2, i3=i3, i4=i4, i5=i5,
+        header_protection_key=hpk,
+        content_padding_addition=cpa,
+        rekey_after_time=rekey_after,
+        rekey_timeout=rekey_timeout,
+        reject_after_time=reject_after,
+        keepalive_timeout=keepalive_timeout,
+        max_handshake_attempts=max_attempts,
+        random_trailers=random_trailers,
+        disable_cookies=disable_cookies,
+        profile=profile,
+        mimic_all=mimic_all,
+        safe_tunnel_mtu=safe_tunnel_mtu,
+        safe_jmax=safe_jmax,
+    )
+    errors = validate_generated(g, header_protection, content_padding)
+    if errors:
+        raise AppError("generated parameters failed validation:\n  - " + "\n  - ".join(errors))
+    return g
+
+
+def print_summary(g: Generated) -> None:
+    print("\nGenerated AWG 3.1 parameters:")
+    print(f"  MTU: {g.mtu}  (conservative bound: {g.safe_tunnel_mtu}, path MTU: {g.path_mtu})")
+    print(f"  Junk: Jc={g.jc}, Jmin={g.jmin}, Jmax={g.jmax} (safe Jmax <= {g.safe_jmax})")
+    print(f"  S: {g.s1}, {g.s2}, {g.s3}, {g.s4}")
+    print(f"  H: {g.h1} | {g.h2} | {g.h3} | {g.h4}")
+    print(f"  CPS: {g.profile}; I packets: {sum(bool(x) for x in [g.i1,g.i2,g.i3,g.i4,g.i5])}")
+    print(f"  HeaderProtectionKey: {'on' if g.header_protection_key else 'off'}")
+    print(f"  ContentPaddingAddition: {g.content_padding_addition or 'off'}")
+    print(f"  Random timers: {'on' if g.rekey_after_time else 'off'}")
+    print(f"  RandomTrailers: {'on' if g.random_trailers else 'off'}")
+    print(f"  DisableCookies: {'on' if g.disable_cookies else 'off'}")
+
+
+
+def write_local_output(path_str: str, data: bytes) -> Path:
+    path = Path(path_str).expanduser()
+    if path.exists() and path.is_dir():
+        raise AppError(f"output path is a directory: {path}")
+    if path.exists() and not ask_bool(f"{path} already exists. Overwrite", False):
+        raise AppError("output cancelled")
+
+    parent = path.parent
+    if not parent.exists():
+        raise AppError(f"output directory does not exist: {parent}")
+
+    # Atomic local write; 0600 because the complete config contains PrivateKey
+    # and peer preshared keys.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            fd = -1
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+        os.chmod(path, 0o600)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def output_config(container: str, config_path: str, output_path: str) -> None:
+    raw = read_container_file(container, config_path)
+    try:
+        original = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise AppError(f"config is not UTF-8: {e}")
+
+    g = generate_interactive(original)
+    block = render_generated_block(g)
+    candidate = merge_config(original, block).encode("utf-8")
+    print_summary(g)
+
+    print("\nCandidate [Interface] AWG block:\n")
+    print(block)
+
+    path = write_local_output(output_path, candidate)
+    print(f"\n[+] Wrote complete config: {path}")
+    print("[+] Container was not modified or restarted.")
+
+
+def update_config(container: str, config_path: str, backup_base: str, dry_run: bool) -> None:
+    raw = read_container_file(container, config_path)
+    try:
+        original = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise AppError(f"config is not UTF-8: {e}")
+
+    g = generate_interactive(original)
+    block = render_generated_block(g)
+    candidate = merge_config(original, block).encode("utf-8")
+    print_summary(g)
+
+    print("\nCandidate [Interface] AWG block:\n")
+    print(block)
+    if dry_run:
+        print("\nDry-run: nothing was written.")
+        return
+    if not ask_bool("Apply this configuration", True):
+        print("Cancelled.")
+        return
+
+    backup = create_backup(backup_base, container, config_path, raw, "pre-update")
+    print(f"[+] Backup: {backup}")
+
+    ok, detail = preflight_in_container(container, config_path, candidate)
+    if ok:
+        print(f"[+] Preflight: {detail}")
+    else:
+        print(f"[!] Preflight failed: {detail}")
+        print("    Current config was NOT changed.")
+        return
+
+    try:
+        copy_bytes_to_container(container, config_path, candidate)
+        print(f"[+] Updated {config_path}")
+        print(f"[+] Restarting container {container}")
+        restart_container(container)
+    except Exception:
+        print("[!] Update/restart failed; restoring the backup automatically.", file=sys.stderr)
+        try:
+            copy_bytes_to_container(container, config_path, raw)
+            restart_container(container)
+            print("[+] Rollback completed.", file=sys.stderr)
+        except Exception as rollback_error:
+            print(f"[!] Automatic rollback also failed: {rollback_error}", file=sys.stderr)
+        raise
+
+    ok_iface, msg = postcheck_interface(container, interface_name(config_path))
+    if ok_iface:
+        print(f"[+] {msg}")
+    else:
+        print(f"[!] {msg}")
+        if ask_bool("Restore the pre-update backup now", True):
+            copy_bytes_to_container(container, config_path, raw)
+            restart_container(container)
+            print("[+] Restored previous config and restarted container.")
+            return
+    print("[+] Done.")
+
+
+def restore_backup(container: str, config_path: str, backup_base: str) -> None:
+    backups = list_backups(backup_base, container)
+    if not backups:
+        print("No backups found.")
+        return
+    print("\nBackups:")
+    for i, p in enumerate(backups[:50], 1):
+        ts = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  {i}. {ts}  {p}")
+    while True:
+        s = ask("Backup number", "1")
+        try:
+            idx = int(s) - 1
+        except ValueError:
+            idx = -1
+        if 0 <= idx < min(len(backups), 50):
+            chosen = backups[idx]
+            break
+        print("  Invalid choice.")
+
+    data = chosen.read_bytes()
+    current = read_container_file(container, config_path)
+    if not ask_bool(f"Restore {chosen.name}", False):
+        print("Cancelled.")
+        return
+    safety = create_backup(backup_base, container, config_path, current, "pre-restore")
+    print(f"[+] Current config saved as: {safety}")
+    copy_bytes_to_container(container, config_path, data)
+    restart_container(container)
+    ok_iface, msg = postcheck_interface(container, interface_name(config_path))
+    print(f"[+] Restored {chosen}")
+    if ok_iface:
+        print(f"[+] {msg}")
+    else:
+        print(f"[!] {msg}")
+
+
+def show_current(container: str, config_path: str) -> None:
+    raw = read_container_file(container, config_path)
+    text = raw.decode("utf-8", errors="replace")
+    in_interface = False
+    print(f"\n{container}:{config_path}\n")
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            in_interface = s.lower() == "[interface]"
+            if not in_interface:
+                break
+            continue
+        if not in_interface:
+            continue
+        m = re.match(r"^\s*#?\s*([A-Za-z][A-Za-z0-9]*)\s*=", line)
+        if m and m.group(1).lower() in MANAGED_KEYS:
+            print(line)
+
+
+def self_test() -> None:
+    sample = """[Interface]\nPrivateKey = lalala\nAddress = 10.8.1.0/24\nListenPort = 39697\nJc = 5\nJmin = 396\nJmax = 839\nS1 = 117\nS2 = 86\nS3 = 12\nS4 = 22\nH1 = 649594889-649623929\nH2 = 1902719804-1902755150\nH3 = 2688654522-2688679233\nH4 = 3994288506-3994290455\n# I1 = <r 10>\n# I2 = <r 20>\n\n[Peer]\nPublicKey = peer1\nPresharedKey = psk1\nAllowedIPs = 10.8.1.1/32\n\n[Peer]\nPublicKey = peer2\nAllowedIPs = 10.8.1.2/32\n"""
+    block = """# --- awg-gen-config AWG 3.1 BEGIN ---\nMTU = 1280\nJc = 5\nJmin = 128\nJmax = 700\nS1 = 20\nS2 = 30\nS3 = 40\nS4 = 16\nH1 = 100000000-100050000\nH2 = 1200000000-1200050000\nH3 = 2400000000-2400050000\nH4 = 3600000000-3600050000\n# I1 = <r 30>\n# I2 = <r 40>\nRandomTrailers = on\nDisableCookies = off\n# --- awg-gen-config AWG 3.1 END ---"""
+    merged = merge_config(sample, block)
+    assert "PrivateKey = lalala" in merged
+    assert "Address = 10.8.1.0/24" in merged
+    assert "ListenPort = 39697" in merged
+    assert merged.count("[Peer]") == 2
+    assert "PublicKey = peer1" in merged and "PublicKey = peer2" in merged
+    assert "Jmin = 396" not in merged
+    assert "# I1 = <r 10>" not in merged
+    assert "# I1 = <r 30>" in merged
+    assert "# I2 = <r 40>" in merged
+    assert "# I2 = <r 20>" not in merged
+    assert "\nI1 = " not in merged
+    assert "\nI2 = " not in merged
+    assert "RandomTrailers = on" in merged
+    assert merged.index("PublicKey = peer1") > merged.index(END_MARKER)
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "export.conf"
+        written = write_local_output(str(out), merged.encode("utf-8"))
+        assert written == out
+        assert out.read_text(encoding="utf-8") == merged
+        assert (out.stat().st_mode & 0o777) == 0o600
+
+    for _ in range(1000):
+        s1, s2, s3, s4 = generate_sizes(False, False, True)
+        assert min(s1, s2, s3, s4) >= 12
+        assert s2 != s1 + 56
+        assert s3 != s1 + 84
+        assert s3 != s2 + 28
+        assert s4 <= 32
+
+    for extreme in (False, True):
+        zones = header_zones(4_294_967_295, extreme)
+        rs = [parse_range(draw_header_range(zones[k], 4_294_967_295)) for k in ("H1", "H2", "H3", "H4")]
+        for i in range(4):
+            for j in range(i + 1, 4):
+                assert not (rs[i][0] <= rs[j][1] and rs[j][0] <= rs[i][1])
+
+    print(f"{APP} self-test: OK")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Interactive AmneziaWG 3.1 Docker server config updater")
+    parser.add_argument("--container", default=DEFAULT_CONTAINER, help=f"Docker container (default: {DEFAULT_CONTAINER})")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"Config path inside container (default: {DEFAULT_CONFIG})")
+    parser.add_argument("--backup-dir", default=DEFAULT_BACKUP_DIR, help=f"Host backup root (default: {DEFAULT_BACKUP_DIR})")
+    parser.add_argument("-o", "--output", metavar="FILE", help="Generate a complete updated config into local FILE; do not modify/restart the container")
+    parser.add_argument("--dry-run", action="store_true", help="Generate and show candidate but do not write")
+    parser.add_argument("--self-test", action="store_true", help="Run built-in tests without Docker")
+    parser.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    args = parser.parse_args()
+
+    if args.output and args.dry_run:
+        parser.error("-o/--output and --dry-run cannot be used together")
+
+    if args.self_test:
+        self_test()
+        return
+    if not docker_exists():
+        die("docker command not found")
+    if not container_exists(args.container):
+        die(f"Docker container {args.container!r} not found")
+    if not container_running(args.container):
+        die(f"Docker container {args.container!r} is not running")
+
+    if args.output:
+        try:
+            output_config(args.container, args.config, args.output)
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+        except AppError as e:
+            die(str(e))
+        return
+
+    while True:
+        print(f"\n{APP} {VERSION}")
+        print(f"Container: {args.container}")
+        print(f"Config:    {args.config}")
+        print("\n  1. Generate AWG 3.1 parameters and update config")
+        print("  2. Restore a backup")
+        print("  3. Show current managed parameters")
+        print("  4. Exit")
+        choice = ask("Choice", "1")
+        try:
+            if choice == "1":
+                update_config(args.container, args.config, args.backup_dir, args.dry_run)
+            elif choice == "2":
+                restore_backup(args.container, args.config, args.backup_dir)
+            elif choice == "3":
+                show_current(args.container, args.config)
+            elif choice == "4":
+                return
+            else:
+                print("Invalid choice.")
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+        except AppError as e:
+            print(f"[!] {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[!] Unexpected error: {e}", file=sys.stderr)
+            if os.environ.get("AWG_GEN_CONFIG_DEBUG") == "1":
+                raise
+
+
+if __name__ == "__main__":
+    main()

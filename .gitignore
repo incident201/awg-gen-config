@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.conf
+!tests/fixtures/*.conf
+*.bak
+*.tmp
+.DS_Store
