@@ -69,7 +69,7 @@ def sample_generated():
 class CliTests(unittest.TestCase):
     def test_version(self):
         p = subprocess.run([str(SCRIPT), "--version"], check=True, capture_output=True, text=True)
-        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.5")
+        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.6")
 
     def test_builtin_self_test(self):
         p = subprocess.run([str(SCRIPT), "--self-test"], check=True, capture_output=True, text=True)
@@ -91,6 +91,34 @@ class ConfigTests(unittest.TestCase):
         for i in range(1, 6):
             self.assertIn(f"# I{i} = <r {100 + i}><t>", block)
             self.assertNotRegex(block, rf"(?m)^I{i}\s*=")
+        self.assertNotRegex(block, r"(?m)^MTU\s*=")
+
+    def test_merge_does_not_add_mtu_when_source_has_none(self):
+        block = awg.render_generated_block(self.generated)
+        merged = awg.merge_config(self.original, block)
+
+        self.assertNotRegex(merged, r"(?m)^\s*MTU\s*=")
+
+    def test_merge_preserves_existing_server_mtu(self):
+        original = self.original.replace("ListenPort = 39697\n", "ListenPort = 39697\nMTU = 1376\n", 1)
+        block = awg.render_generated_block(self.generated)
+        merged = awg.merge_config(original, block)
+
+        self.assertEqual(merged.count("MTU ="), 1)
+        self.assertIn("MTU = 1376", merged)
+        self.assertNotIn("MTU = 1280", merged)
+
+    def test_merge_preserves_mtu_from_legacy_generated_block(self):
+        legacy_block = awg.render_generated_block(self.generated).replace(
+            awg.BEGIN_MARKER, f"{awg.BEGIN_MARKER}\nMTU = 1376", 1
+        )
+        original = self.original.replace("ListenPort = 39697\n", f"ListenPort = 39697\n{legacy_block}\n", 1)
+        block = awg.render_generated_block(self.generated)
+        merged = awg.merge_config(original, block)
+
+        self.assertEqual(merged.count("MTU ="), 1)
+        self.assertIn("MTU = 1376", merged)
+        self.assertNotIn("MTU = 1280", merged)
 
     def test_merge_preserves_server_identity_and_peers(self):
         block = awg.render_generated_block(self.generated)
@@ -142,6 +170,7 @@ class ConfigTests(unittest.TestCase):
             exported = target.read_text(encoding="utf-8")
             self.assertIn("PrivateKey = server-private-key", exported)
             self.assertIn("# I1 = <r 101><t>", exported)
+            self.assertNotRegex(exported, r"(?m)^\s*MTU\s*=")
             self.assertEqual(exported[exported.index("[Peer]"):].strip(), self.original[self.original.index("[Peer]"):].strip())
 
 

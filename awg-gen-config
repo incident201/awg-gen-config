@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 APP = "awg-gen-config"
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 DEFAULT_CONTAINER = "amnezia-awg2"
 DEFAULT_CONFIG = "/opt/amnezia/awg/awg0.conf"
 DEFAULT_BACKUP_DIR = "/var/backups/awg-gen-config"
@@ -55,7 +55,6 @@ BEGIN_MARKER = "# --- awg-gen-config AWG 3.1 BEGIN ---"
 END_MARKER = "# --- awg-gen-config AWG 3.1 END ---"
 
 MANAGED_KEYS = {
-    "mtu",
     "jc", "jmin", "jmax",
     "s1", "s2", "s3", "s4",
     "h1", "h2", "h3", "h4",
@@ -415,22 +414,6 @@ def parse_range(s: str) -> tuple[int, int]:
     return lo, hi
 
 
-def extract_interface_value(text: str, key: str) -> Optional[str]:
-    in_interface = False
-    target = key.lower()
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_interface = stripped.lower() == "[interface]"
-            continue
-        if not in_interface or stripped.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        if k.strip().lower() == target:
-            return v.strip()
-    return None
-
-
 def remove_managed_from_interface(lines: list[str]) -> list[str]:
     out: list[str] = []
     in_interface = False
@@ -443,6 +426,10 @@ def remove_managed_from_interface(lines: list[str]) -> list[str]:
         if in_our_block:
             if stripped == END_MARKER:
                 in_our_block = False
+            elif re.match(r"^\s*#?\s*MTU\s*=", line, re.IGNORECASE):
+                # Older releases rendered MTU inside the managed block. Keep
+                # that existing server setting while removing old AWG data.
+                out.append(line)
             continue
 
         if stripped.startswith("[") and stripped.endswith("]"):
@@ -929,7 +916,6 @@ def render_generated_block(g: Generated) -> str:
     lines = [
         BEGIN_MARKER,
         f"# profile={g.profile}; intensity={g.intensity}; path-mtu={g.path_mtu}; outer-ipv{g.outer_ip_version}",
-        f"MTU = {g.mtu}",
         "",
         f"Jc = {g.jc}",
         f"Jmin = {g.jmin}",
@@ -1016,23 +1002,19 @@ def generate_interactive(current_text: str) -> Generated:
     safe_jmax = path_mtu - outer_ip_header - 8
     if safe_tunnel_mtu < 576:
         raise AppError(
-            f"selected path MTU leaves only {safe_tunnel_mtu} bytes for tunnel MTU with S4={s4}; choose a larger path MTU or different settings"
+            f"selected path MTU leaves only {safe_tunnel_mtu} bytes for CPS generation MTU with S4={s4}; choose a larger path MTU or different settings"
         )
 
-    current_mtu_raw = extract_interface_value(current_text, "MTU")
-    current_mtu = None
-    if current_mtu_raw:
-        try:
-            current_mtu = int(current_mtu_raw)
-        except ValueError:
-            pass
-    recommended = current_mtu if current_mtu and current_mtu <= safe_tunnel_mtu else min(1280, safe_tunnel_mtu)
-    print(f"\n  S4={s4}; conservative no-fragmentation tunnel MTU <= {safe_tunnel_mtu} for selected outer path.")
-    mtu = ask_int("AWG interface MTU", recommended, 576, 9000)
+    # This is a generator input for CPS packet sizing only. The server
+    # interface MTU, if present in awg0.conf, is deliberately not read or
+    # changed here.
+    recommended = min(1280, safe_tunnel_mtu)
+    print(f"\n  S4={s4}; conservative CPS generation MTU bound <= {safe_tunnel_mtu} for selected outer path.")
+    mtu = ask_int("Client/CPS MTU used for generation", recommended, 576, 9000)
     if mtu > safe_tunnel_mtu:
-        print(f"  WARNING: MTU {mtu} exceeds conservative bound {safe_tunnel_mtu}; outer fragmentation/PMTU handling may be required.")
-        if not ask_bool("Keep this MTU anyway", False):
-            mtu = ask_int("AWG interface MTU", min(1280, safe_tunnel_mtu), 576, safe_tunnel_mtu)
+        print(f"  WARNING: CPS generation MTU {mtu} exceeds conservative bound {safe_tunnel_mtu}; outer fragmentation/PMTU handling may be required.")
+        if not ask_bool("Keep this CPS generation MTU anyway", False):
+            mtu = ask_int("Client/CPS MTU used for generation", min(1280, safe_tunnel_mtu), 576, safe_tunnel_mtu)
 
     jc, jmin, jmax = generate_junk(intensity, junk_level, router_mode, extreme, safe_jmax)
     print(f"  Safe outer UDP junk payload ceiling for this path: {safe_jmax} bytes; generated Jmax={jmax}.")
@@ -1112,7 +1094,7 @@ def generate_interactive(current_text: str) -> Generated:
 
 def print_summary(g: Generated) -> None:
     print("\nGenerated AWG 3.1 parameters:")
-    print(f"  MTU: {g.mtu}  (conservative bound: {g.safe_tunnel_mtu}, path MTU: {g.path_mtu})")
+    print(f"  CPS generation MTU: {g.mtu}  (safe bound from path MTU: {g.safe_tunnel_mtu}, path MTU: {g.path_mtu})")
     print(f"  Junk: Jc={g.jc}, Jmin={g.jmin}, Jmax={g.jmax} (safe Jmax <= {g.safe_jmax})")
     print(f"  S: {g.s1}, {g.s2}, {g.s3}, {g.s4}")
     print(f"  H: {g.h1} | {g.h2} | {g.h3} | {g.h4}")
@@ -1296,7 +1278,7 @@ def show_current(container: str, config_path: str) -> None:
 
 def self_test() -> None:
     sample = """[Interface]\nPrivateKey = lalala\nAddress = 10.8.1.0/24\nListenPort = 39697\nJc = 5\nJmin = 396\nJmax = 839\nS1 = 117\nS2 = 86\nS3 = 12\nS4 = 22\nH1 = 649594889-649623929\nH2 = 1902719804-1902755150\nH3 = 2688654522-2688679233\nH4 = 3994288506-3994290455\n# I1 = <r 10>\n# I2 = <r 20>\n\n[Peer]\nPublicKey = peer1\nPresharedKey = psk1\nAllowedIPs = 10.8.1.1/32\n\n[Peer]\nPublicKey = peer2\nAllowedIPs = 10.8.1.2/32\n"""
-    block = """# --- awg-gen-config AWG 3.1 BEGIN ---\nMTU = 1280\nJc = 5\nJmin = 128\nJmax = 700\nS1 = 20\nS2 = 30\nS3 = 40\nS4 = 16\nH1 = 100000000-100050000\nH2 = 1200000000-1200050000\nH3 = 2400000000-2400050000\nH4 = 3600000000-3600050000\n# I1 = <r 30>\n# I2 = <r 40>\nRandomTrailers = on\nDisableCookies = off\n# --- awg-gen-config AWG 3.1 END ---"""
+    block = """# --- awg-gen-config AWG 3.1 BEGIN ---\nJc = 5\nJmin = 128\nJmax = 700\nS1 = 20\nS2 = 30\nS3 = 40\nS4 = 16\nH1 = 100000000-100050000\nH2 = 1200000000-1200050000\nH3 = 2400000000-2400050000\nH4 = 3600000000-3600050000\n# I1 = <r 30>\n# I2 = <r 40>\nRandomTrailers = on\nDisableCookies = off\n# --- awg-gen-config AWG 3.1 END ---"""
     merged = merge_config(sample, block)
     assert "PrivateKey = lalala" in merged
     assert "Address = 10.8.1.0/24" in merged
@@ -1308,10 +1290,16 @@ def self_test() -> None:
     assert "# I1 = <r 30>" in merged
     assert "# I2 = <r 40>" in merged
     assert "# I2 = <r 20>" not in merged
+    assert "MTU =" not in merged
     assert "\nI1 = " not in merged
     assert "\nI2 = " not in merged
     assert "RandomTrailers = on" in merged
     assert merged.index("PublicKey = peer1") > merged.index(END_MARKER)
+
+    sample_with_mtu = sample.replace("ListenPort = 39697\n", "ListenPort = 39697\nMTU = 1376\n", 1)
+    merged_with_mtu = merge_config(sample_with_mtu, block)
+    assert merged_with_mtu.count("MTU =") == 1
+    assert "MTU = 1376" in merged_with_mtu
 
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "export.conf"
