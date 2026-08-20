@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 APP = "awg-gen-config"
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 DEFAULT_CONTAINER = "amnezia-awg2"
 DEFAULT_CONFIG = "/opt/amnezia/awg/awg0.conf"
 DEFAULT_BACKUP_DIR = "/var/backups/awg-gen-config"
@@ -46,10 +46,8 @@ RNG = secrets.SystemRandom()
 MSG_INIT = 148
 MSG_RESPONSE = 92
 MSG_COOKIE = 64
-MSG_TRANSPORT_OVERHEAD = 32  # 16-byte transport header + 16-byte Poly1305 tag
 HP_NONCE_SIZE = 12
 S4_PROTOCOL_MAX = 32
-DEFAULT_UDP_WINDOW = 500
 
 BEGIN_MARKER = "# --- awg-gen-config AWG 3.1 BEGIN ---"
 END_MARKER = "# --- awg-gen-config AWG 3.1 END ---"
@@ -136,8 +134,6 @@ class CpsOptions:
 @dataclass
 class Generated:
     mtu: int
-    path_mtu: int
-    outer_ip_version: int
     intensity: str
     router_mode: bool
     extreme: bool
@@ -168,8 +164,6 @@ class Generated:
     disable_cookies: bool
     profile: str
     mimic_all: bool
-    safe_tunnel_mtu: int
-    safe_jmax: int
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -541,7 +535,7 @@ def generate_sizes(router_mode: bool, extreme: bool, header_protection: bool) ->
     raise AppError("failed to draw non-colliding S1-S4")
 
 
-def generate_junk(intensity: str, junk_level: int, router_mode: bool, extreme: bool, safe_jmax: int) -> tuple[int, int, int]:
+def generate_junk(intensity: str, junk_level: int, router_mode: bool, extreme: bool) -> tuple[int, int, int]:
     normal_min = {
         "low": (64, 256),
         "medium": (128, 512),
@@ -570,23 +564,8 @@ def generate_junk(intensity: str, junk_level: int, router_mode: bool, extreme: b
         min_range = normal_min[intensity]
         max_range = normal_max[intensity]
 
-    max_hi = min(max_range[1], safe_jmax)
-    max_lo = min(max_range[0], max_hi)
-    # Jmax must leave at least 64 bytes below it for Jmin variation.
-    jmin_hi = min(min_range[1], max_hi - 65)
-    jmin_lo = min_range[0]
-    if jmin_hi < jmin_lo:
-        # Path MTU is too small for the selected intensity. Adapt rather than emit an invalid pair.
-        jmin_lo = max(1, min(64, max_hi - 65))
-        jmin_hi = max(jmin_lo, max_hi - 65)
-    if max_hi < 66:
-        raise AppError(f"path MTU is too small for a useful junk train (safe Jmax={safe_jmax})")
-
-    jmin = rnd(jmin_lo, jmin_hi)
-    lower_jmax = max(max_lo, jmin + 65)
-    if lower_jmax > max_hi:
-        lower_jmax = jmin + 65
-    jmax = rnd(lower_jmax, max_hi)
+    jmin = rnd(*min_range)
+    jmax = rnd(max(max_range[0], jmin + 65), max_range[1])
     return jc, jmin, jmax
 
 
@@ -903,8 +882,6 @@ def validate_generated(g: Generated, header_protection: bool, content_padding_en
         errors.append("S1-S4 must be >=12 with HeaderProtectionKey")
     if g.jc < 0 or g.jmin < 0 or g.jmax <= g.jmin + 64:
         errors.append("invalid junk range")
-    if g.jmax > g.safe_jmax:
-        errors.append("Jmax exceeds safe outer UDP payload for selected path MTU")
     if len(base64.b64decode(g.header_protection_key or "", validate=True)) != 32 if g.header_protection_key else False:
         errors.append("HeaderProtectionKey is not 32 bytes")
     if content_padding_enabled and not g.content_padding_addition:
@@ -915,7 +892,7 @@ def validate_generated(g: Generated, header_protection: bool, content_padding_en
 def render_generated_block(g: Generated) -> str:
     lines = [
         BEGIN_MARKER,
-        f"# profile={g.profile}; intensity={g.intensity}; path-mtu={g.path_mtu}; outer-ipv{g.outer_ip_version}",
+        f"# profile={g.profile}; intensity={g.intensity}",
         "",
         f"Jc = {g.jc}",
         f"Jmin = {g.jmin}",
@@ -960,11 +937,11 @@ def render_generated_block(g: Generated) -> str:
     return "\n".join(lines)
 
 
-def generate_interactive(current_text: str) -> Generated:
+def generate_interactive() -> Generated:
     print("\nAWG 3.1 generation\n")
 
-    path_mtu = ask_int("Outer/path MTU", 1500, 576, 9000)
-    outer_ip = int(ask_choice("Outer IP header to budget for:", [("6", "IPv6 / conservative (40-byte IP header)"), ("4", "IPv4 only (20-byte IP header)")], 0))
+    print("MTU presets: 1500 Ethernet, 1420 WG / PPPoE, 1280 min IPv6")
+    mtu = ask_int("MTU", 1500, 576, 9000)
 
     router_mode = ask_bool("Router/low-power mode", False)
     extreme = ask_bool("Extreme parameter ceilings", False)
@@ -995,29 +972,7 @@ def generate_interactive(current_text: str) -> Generated:
 
     s1, s2, s3, s4 = generate_sizes(router_mode, extreme, header_protection)
 
-    # Conservative no-fragmentation budget for a full-size transport packet:
-    # inner MTU + S4 + 32 WG/AWG transport bytes + UDP(8) + outer IP(20/40).
-    outer_ip_header = 40 if outer_ip == 6 else 20
-    safe_tunnel_mtu = path_mtu - outer_ip_header - 8 - MSG_TRANSPORT_OVERHEAD - s4
-    safe_jmax = path_mtu - outer_ip_header - 8
-    if safe_tunnel_mtu < 576:
-        raise AppError(
-            f"selected path MTU leaves only {safe_tunnel_mtu} bytes for CPS generation MTU with S4={s4}; choose a larger path MTU or different settings"
-        )
-
-    # This is a generator input for CPS packet sizing only. The server
-    # interface MTU, if present in awg0.conf, is deliberately not read or
-    # changed here.
-    recommended = min(1280, safe_tunnel_mtu)
-    print(f"\n  S4={s4}; conservative CPS generation MTU bound <= {safe_tunnel_mtu} for selected outer path.")
-    mtu = ask_int("Client/CPS MTU used for generation", recommended, 576, 9000)
-    if mtu > safe_tunnel_mtu:
-        print(f"  WARNING: CPS generation MTU {mtu} exceeds conservative bound {safe_tunnel_mtu}; outer fragmentation/PMTU handling may be required.")
-        if not ask_bool("Keep this CPS generation MTU anyway", False):
-            mtu = ask_int("Client/CPS MTU used for generation", min(1280, safe_tunnel_mtu), 576, safe_tunnel_mtu)
-
-    jc, jmin, jmax = generate_junk(intensity, junk_level, router_mode, extreme, safe_jmax)
-    print(f"  Safe outer UDP junk payload ceiling for this path: {safe_jmax} bytes; generated Jmax={jmax}.")
+    jc, jmin, jmax = generate_junk(intensity, junk_level, router_mode, extreme)
 
     zones = header_zones(max_h, extreme)
     h1 = draw_header_range(zones["H1"], max_h)
@@ -1066,7 +1021,7 @@ def generate_interactive(current_text: str) -> Generated:
         rekey_after = rekey_timeout = reject_after = keepalive_timeout = max_attempts = ""
 
     g = Generated(
-        mtu=mtu, path_mtu=path_mtu, outer_ip_version=outer_ip, intensity=intensity,
+        mtu=mtu, intensity=intensity,
         router_mode=router_mode, extreme=extreme,
         jc=jc, jmin=jmin, jmax=jmax,
         s1=s1, s2=s2, s3=s3, s4=s4,
@@ -1083,8 +1038,6 @@ def generate_interactive(current_text: str) -> Generated:
         disable_cookies=disable_cookies,
         profile=profile,
         mimic_all=mimic_all,
-        safe_tunnel_mtu=safe_tunnel_mtu,
-        safe_jmax=safe_jmax,
     )
     errors = validate_generated(g, header_protection, content_padding)
     if errors:
@@ -1094,8 +1047,8 @@ def generate_interactive(current_text: str) -> Generated:
 
 def print_summary(g: Generated) -> None:
     print("\nGenerated AWG 3.1 parameters:")
-    print(f"  CPS generation MTU: {g.mtu}  (safe bound from path MTU: {g.safe_tunnel_mtu}, path MTU: {g.path_mtu})")
-    print(f"  Junk: Jc={g.jc}, Jmin={g.jmin}, Jmax={g.jmax} (safe Jmax <= {g.safe_jmax})")
+    print(f"  MTU used for CPS generation: {g.mtu}")
+    print(f"  Junk: Jc={g.jc}, Jmin={g.jmin}, Jmax={g.jmax}")
     print(f"  S: {g.s1}, {g.s2}, {g.s3}, {g.s4}")
     print(f"  H: {g.h1} | {g.h2} | {g.h3} | {g.h4}")
     print(f"  CPS: {g.profile}; I packets: {sum(bool(x) for x in [g.i1,g.i2,g.i3,g.i4,g.i5])}")
@@ -1147,7 +1100,7 @@ def output_config(container: str, config_path: str, output_path: str) -> None:
     except UnicodeDecodeError as e:
         raise AppError(f"config is not UTF-8: {e}")
 
-    g = generate_interactive(original)
+    g = generate_interactive()
     block = render_generated_block(g)
     candidate = merge_config(original, block).encode("utf-8")
     print_summary(g)
@@ -1167,7 +1120,7 @@ def update_config(container: str, config_path: str, backup_base: str, dry_run: b
     except UnicodeDecodeError as e:
         raise AppError(f"config is not UTF-8: {e}")
 
-    g = generate_interactive(original)
+    g = generate_interactive()
     block = render_generated_block(g)
     candidate = merge_config(original, block).encode("utf-8")
     print_summary(g)
@@ -1315,6 +1268,17 @@ def self_test() -> None:
         assert s3 != s1 + 84
         assert s3 != s2 + 28
         assert s4 <= 32
+
+    junk_ranges = {
+        "low": (64, 256, 256, 512),
+        "medium": (128, 512, 512, 1024),
+        "high": (256, 768, 768, 1280),
+    }
+    for intensity, (jmin_lo, jmin_hi, jmax_lo, jmax_hi) in junk_ranges.items():
+        for _ in range(100):
+            _, jmin, jmax = generate_junk(intensity, 5, False, False)
+            assert jmin_lo <= jmin <= jmin_hi
+            assert jmax_lo <= jmax <= jmax_hi
 
     for extreme in (False, True):
         zones = header_zones(4_294_967_295, extreme)

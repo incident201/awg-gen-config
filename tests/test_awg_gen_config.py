@@ -29,8 +29,6 @@ awg = load_module()
 def sample_generated():
     return awg.Generated(
         mtu=1280,
-        path_mtu=1500,
-        outer_ip_version=6,
         intensity="medium",
         router_mode=False,
         extreme=False,
@@ -61,15 +59,13 @@ def sample_generated():
         disable_cookies=False,
         profile="quic_initial",
         mimic_all=False,
-        safe_tunnel_mtu=1404,
-        safe_jmax=1452,
     )
 
 
 class CliTests(unittest.TestCase):
     def test_version(self):
         p = subprocess.run([str(SCRIPT), "--version"], check=True, capture_output=True, text=True)
-        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.6")
+        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.7")
 
     def test_builtin_self_test(self):
         p = subprocess.run([str(SCRIPT), "--self-test"], check=True, capture_output=True, text=True)
@@ -88,6 +84,9 @@ class ConfigTests(unittest.TestCase):
 
     def test_i1_i5_are_rendered_as_comments(self):
         block = awg.render_generated_block(self.generated)
+        self.assertIn("# profile=quic_initial; intensity=medium", block)
+        self.assertNotIn("path-mtu", block)
+        self.assertNotIn("outer-ipv", block)
         for i in range(1, 6):
             self.assertIn(f"# I{i} = <r {100 + i}><t>", block)
             self.assertNotRegex(block, rf"(?m)^I{i}\s*=")
@@ -107,6 +106,116 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(merged.count("MTU ="), 1)
         self.assertIn("MTU = 1376", merged)
         self.assertNotIn("MTU = 1280", merged)
+
+    def test_cps_mtu_is_passed_to_packet_padding(self):
+        options = awg.CpsOptions(
+            mtu=576,
+            intensity="medium",
+            host="example.com",
+            use_tag_c=False,
+            use_tag_t=True,
+            use_tag_r=True,
+            use_tag_rc=True,
+            use_tag_rd=True,
+            use_browser_fp=False,
+            browser_profile="chrome",
+            mimic_all=False,
+        )
+        real_calc_padding = awg.calc_padding
+        calls = []
+
+        def capture_padding(*args, **kwargs):
+            mtu = kwargs["mtu"] if "mtu" in kwargs else args[4]
+            padding = real_calc_padding(*args, **kwargs)
+            calls.append((mtu, args[0], args[1], padding))
+            return padding
+
+        with mock.patch.object(awg, "calc_padding", side_effect=capture_padding):
+            awg.mk_quic_initial(options)
+
+        self.assertTrue(calls)
+        self.assertEqual({call[0] for call in calls}, {576})
+        for mtu, header_size, extra_size, padding in calls:
+            self.assertLessEqual(header_size + extra_size + padding, mtu)
+
+    def test_junk_ranges_are_architect_ranges_independent_of_mtu(self):
+        expected = {
+            "low": (64, 256, 256, 512),
+            "medium": (128, 512, 512, 1024),
+            "high": (256, 768, 768, 1280),
+        }
+        for intensity, (jmin_lo, jmin_hi, jmax_lo, jmax_hi) in expected.items():
+            for _ in range(100):
+                _, jmin, jmax = awg.generate_junk(intensity, 5, False, False)
+                self.assertGreaterEqual(jmin, jmin_lo)
+                self.assertLessEqual(jmin, jmin_hi)
+                self.assertGreaterEqual(jmax, jmax_lo)
+                self.assertLessEqual(jmax, jmax_hi)
+
+        with mock.patch.object(awg, "rnd", side_effect=lambda low, high: high):
+            _, jmin, jmax = awg.generate_junk("medium", 5, False, False)
+        self.assertEqual(jmin, 512)
+        self.assertEqual(jmax, 1024)
+
+        for _ in range(100):
+            jc, jmin, jmax = awg.generate_junk("medium", 5, True, False)
+            self.assertLessEqual(jc, 3)
+            self.assertGreaterEqual(jmin, 16)
+            self.assertLessEqual(jmin, 31)
+            self.assertGreaterEqual(jmax, 96)
+            self.assertLessEqual(jmax, 128)
+
+    def test_interactive_has_one_architect_mtu_question(self):
+        int_prompts = []
+        choice_prompts = []
+        bool_prompts = []
+        text_prompts = []
+        captured = {}
+
+        def fake_ask_int(prompt, default, low, high):
+            int_prompts.append(prompt)
+            return default
+
+        def fake_ask_choice(prompt, options, default):
+            choice_prompts.append(prompt)
+            return options[default][0]
+
+        def fake_ask_bool(prompt, default):
+            bool_prompts.append(prompt)
+            return default
+
+        def fake_ask(prompt, default=""):
+            text_prompts.append(prompt)
+            return default
+
+        def fake_generate_cps(profile, options, router_mode):
+            captured["options"] = options
+            return "i1", "i2", "i3", "i4", "i5", profile
+
+        with mock.patch.object(awg, "ask_int", side_effect=fake_ask_int), \
+             mock.patch.object(awg, "ask_choice", side_effect=fake_ask_choice), \
+             mock.patch.object(awg, "ask_bool", side_effect=fake_ask_bool), \
+             mock.patch.object(awg, "ask", side_effect=fake_ask), \
+             mock.patch.object(awg, "generate_cps", side_effect=fake_generate_cps):
+            generated = awg.generate_interactive()
+
+        prompts = int_prompts + choice_prompts + bool_prompts + text_prompts
+        self.assertEqual(int_prompts.count("MTU"), 1)
+        self.assertNotIn("Outer/path MTU", prompts)
+        self.assertNotIn("Outer IP header to budget for:", prompts)
+        self.assertFalse(any("safe tunnel" in prompt.lower() for prompt in prompts))
+        self.assertFalse(any("safe jmax" in prompt.lower() for prompt in prompts))
+        self.assertEqual(captured["options"].mtu, 1500)
+        self.assertEqual(generated.mtu, 1500)
+
+    def test_summary_uses_simple_generator_mtu_label(self):
+        with mock.patch("builtins.print") as printer:
+            awg.print_summary(self.generated)
+
+        lines = [call.args[0] for call in printer.call_args_list]
+        self.assertIn("  MTU used for CPS generation: 1280", lines)
+        self.assertFalse(any("path MTU" in line for line in lines))
+        self.assertFalse(any("safe bound" in line for line in lines))
 
     def test_merge_preserves_mtu_from_legacy_generated_block(self):
         legacy_block = awg.render_generated_block(self.generated).replace(
