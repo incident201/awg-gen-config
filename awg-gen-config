@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 APP = "awg-gen-config"
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 DEFAULT_CONTAINER = "amnezia-awg2"
 DEFAULT_CONFIG = "/opt/amnezia/awg/awg0.conf"
 DEFAULT_BACKUP_DIR = "/var/backups/awg-gen-config"
@@ -565,7 +565,11 @@ def generate_junk(intensity: str, junk_level: int, router_mode: bool, extreme: b
         max_range = normal_max[intensity]
 
     jmin = rnd(*min_range)
-    jmax = rnd(max(max_range[0], jmin + 65), max_range[1])
+    jmax = rnd(*max_range)
+
+    floor = jmin + 64
+    if jmax <= floor:
+        jmax = floor + rnd(64, 256)
     return jc, jmin, jmax
 
 
@@ -1274,11 +1278,12 @@ def self_test() -> None:
         "medium": (128, 512, 512, 1024),
         "high": (256, 768, 768, 1280),
     }
-    for intensity, (jmin_lo, jmin_hi, jmax_lo, jmax_hi) in junk_ranges.items():
+    for intensity, (jmin_lo, jmin_hi, jmax_lo, _) in junk_ranges.items():
         for _ in range(100):
             _, jmin, jmax = generate_junk(intensity, 5, False, False)
             assert jmin_lo <= jmin <= jmin_hi
-            assert jmax_lo <= jmax <= jmax_hi
+            assert jmax >= jmax_lo
+            assert jmax > jmin + 64
 
     for extreme in (False, True):
         zones = header_zones(4_294_967_295, extreme)

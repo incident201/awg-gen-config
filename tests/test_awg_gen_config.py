@@ -65,7 +65,7 @@ def sample_generated():
 class CliTests(unittest.TestCase):
     def test_version(self):
         p = subprocess.run([str(SCRIPT), "--version"], check=True, capture_output=True, text=True)
-        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.7")
+        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.8")
 
     def test_builtin_self_test(self):
         p = subprocess.run([str(SCRIPT), "--self-test"], check=True, capture_output=True, text=True)
@@ -145,25 +145,42 @@ class ConfigTests(unittest.TestCase):
             "high": (256, 768, 768, 1280),
         }
         for intensity, (jmin_lo, jmin_hi, jmax_lo, jmax_hi) in expected.items():
+            with mock.patch.object(awg, "rnd", side_effect=[jmin_lo, jmax_lo]) as draw:
+                jc, jmin, jmax = awg.generate_junk(intensity, 0, False, False)
+
+            self.assertEqual(jc, 0)
+            self.assertEqual(jmin, jmin_lo)
+            self.assertEqual(jmax, jmax_lo)
+            self.assertEqual(draw.call_args_list, [mock.call(jmin_lo, jmin_hi), mock.call(jmax_lo, jmax_hi)])
+            self.assertGreater(jmax, jmin + 64)
+
+        with mock.patch.object(awg, "rnd", side_effect=[256, 256, 256]) as draw:
+            _, jmin, jmax = awg.generate_junk("low", 0, False, False)
+
+        self.assertEqual(draw.call_args_list, [mock.call(64, 256), mock.call(256, 512), mock.call(64, 256)])
+        self.assertEqual(jmin, 256)
+        self.assertEqual(jmax, 256 + 64 + 256)
+        self.assertGreater(jmax, 512)
+        self.assertGreater(jmax, jmin + 64)
+
+        for intensity, (jmin_lo, jmin_hi, jmax_lo, _) in expected.items():
             for _ in range(100):
                 _, jmin, jmax = awg.generate_junk(intensity, 5, False, False)
                 self.assertGreaterEqual(jmin, jmin_lo)
                 self.assertLessEqual(jmin, jmin_hi)
                 self.assertGreaterEqual(jmax, jmax_lo)
-                self.assertLessEqual(jmax, jmax_hi)
+                self.assertGreater(jmax, jmin + 64)
 
-        with mock.patch.object(awg, "rnd", side_effect=lambda low, high: high):
-            _, jmin, jmax = awg.generate_junk("medium", 5, False, False)
-        self.assertEqual(jmin, 512)
-        self.assertEqual(jmax, 1024)
-
-        for _ in range(100):
+        with mock.patch.object(awg, "rnd", side_effect=[-1, 16, 96]) as draw:
             jc, jmin, jmax = awg.generate_junk("medium", 5, True, False)
-            self.assertLessEqual(jc, 3)
-            self.assertGreaterEqual(jmin, 16)
-            self.assertLessEqual(jmin, 31)
-            self.assertGreaterEqual(jmax, 96)
-            self.assertLessEqual(jmax, 128)
+
+        self.assertEqual(draw.call_args_list, [mock.call(-1, 1), mock.call(16, 31), mock.call(96, 128)])
+        self.assertLessEqual(jc, 3)
+        self.assertGreaterEqual(jmin, 16)
+        self.assertLessEqual(jmin, 31)
+        self.assertGreaterEqual(jmax, 96)
+        self.assertLessEqual(jmax, 128)
+        self.assertGreater(jmax, jmin + 64)
 
     def test_interactive_has_one_architect_mtu_question(self):
         int_prompts = []
