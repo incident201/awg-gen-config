@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 APP = "awg-gen-config"
-VERSION = "0.1.8"
+VERSION = "0.1.9"
 DEFAULT_CONTAINER = "amnezia-awg2"
 DEFAULT_CONFIG = "/opt/amnezia/awg/awg0.conf"
 DEFAULT_BACKUP_DIR = "/var/backups/awg-gen-config"
@@ -555,7 +555,7 @@ def generate_junk(intensity: str, junk_level: int, router_mode: bool, extreme: b
         # Mirrors Architect's extreme-mode behavior when level=0.
         jc = rnd(1, min(8, ceiling))
     if router_mode:
-        jc = 0 if junk_level == 0 else min(jc, 3)
+        jc = min(jc, 3)
 
     if router_mode:
         min_range = (16, 31)

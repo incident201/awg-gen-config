@@ -4,7 +4,7 @@
 
 Утилита предназначена для случая, когда Amnezia уже установлена и серверный конфиг существует. Она **не создаёт VPN с нуля** и не меняет ключи, адреса или список пиров. Вместо этого она полностью регенерирует набор параметров обфускации AWG и аккуратно встраивает его в существующий конфиг.
 
-Текущая версия: **0.1.8**.
+Текущая версия: **0.1.9**.
 
 ## Что делает
 
@@ -64,7 +64,7 @@ awg-gen-config --self-test
 Ожидаемый результат:
 
 ```text
-awg-gen-config 0.1.8
+awg-gen-config 0.1.9
 awg-gen-config self-test: OK
 ```
 
@@ -306,8 +306,6 @@ python3 -m unittest discover -s tests -v
 - права `0600` на локальный export;
 - отсутствие container write/restart/backup в `-o` режиме.
 
-В `.github/workflows/tests.yml` есть GitHub Actions matrix для Python 3.9, 3.11 и 3.13.
-
 ## Структура репозитория
 
 ```text
@@ -316,10 +314,8 @@ python3 -m unittest discover -s tests -v
 ├── README.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
+├── SHA256SUMS
 ├── .gitignore
-├── .github/
-│   └── workflows/
-│       └── tests.yml
 └── tests/
     ├── test_awg_gen_config.py
     └── fixtures/

@@ -65,7 +65,7 @@ def sample_generated():
 class CliTests(unittest.TestCase):
     def test_version(self):
         p = subprocess.run([str(SCRIPT), "--version"], check=True, capture_output=True, text=True)
-        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.8")
+        self.assertEqual(p.stdout.strip(), "awg-gen-config 0.1.9")
 
     def test_builtin_self_test(self):
         p = subprocess.run([str(SCRIPT), "--self-test"], check=True, capture_output=True, text=True)
@@ -181,6 +181,27 @@ class ConfigTests(unittest.TestCase):
         self.assertGreaterEqual(jmax, 96)
         self.assertLessEqual(jmax, 128)
         self.assertGreater(jmax, jmin + 64)
+
+    def test_router_extreme_zero_junk_keeps_nonzero_jc(self):
+        with mock.patch.object(awg, "rnd", side_effect=[6, 16, 96]) as draw:
+            jc, jmin, jmax = awg.generate_junk("medium", 0, True, True)
+
+        self.assertEqual(draw.call_args_list, [mock.call(1, 8), mock.call(16, 31), mock.call(96, 128)])
+        self.assertEqual(jc, 3)
+        self.assertGreaterEqual(jmin, 16)
+        self.assertLessEqual(jmin, 31)
+        self.assertGreaterEqual(jmax, 96)
+        self.assertLessEqual(jmax, 128)
+
+    def test_router_non_extreme_zero_junk_stays_zero(self):
+        with mock.patch.object(awg, "rnd", side_effect=[16, 96]):
+            jc, jmin, jmax = awg.generate_junk("medium", 0, True, False)
+
+        self.assertEqual(jc, 0)
+        self.assertGreaterEqual(jmin, 16)
+        self.assertLessEqual(jmin, 31)
+        self.assertGreaterEqual(jmax, 96)
+        self.assertLessEqual(jmax, 128)
 
     def test_interactive_has_one_architect_mtu_question(self):
         int_prompts = []
